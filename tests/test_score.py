@@ -16,12 +16,14 @@ from benchmark.score import (  # noqa: E402
     commit_kind,
     is_release_subject,
     kind_recall,
+    module_file_weights,
     module_recall,
     objective_score,
     parse_semver,
     plan_kind,
     release_predicted,
     release_signaled,
+    weighted_module_recall,
 )
 
 REVEALED = [
@@ -33,6 +35,49 @@ REVEALED = [
 
 def test_changed_modules():
     assert changed_modules(REVEALED) == {"plugins", "readme", "core", "changelog"}
+
+
+def test_module_file_weights_counts_files_per_module():
+    revealed = [
+        {"files": ["plugins/a.py", "plugins/b.py", "plugins/c.py"]},
+        {"files": ["docs/readme.md"]},
+    ]
+    assert module_file_weights(revealed) == {"plugins": 3, "docs": 1}
+
+
+def test_weighted_module_recall_favors_high_effort_module():
+    # 4 files total: 3 in "plugins", 1 in "docs" -- a plan naming the module where most
+    # of the revealed effort landed should score higher than one naming the small module,
+    # unlike plain module_recall which weighs every touched module equally (#43).
+    revealed = [
+        {"files": ["plugins/a.py", "plugins/b.py", "plugins/c.py"]},
+        {"files": ["docs/readme.md"]},
+    ]
+    plan_big = [{"title": "extend plugins", "theme": "plugins"}]
+    plan_small = [{"title": "update docs", "theme": "docs"}]
+
+    assert weighted_module_recall(plan_big, revealed)["weighted_module_recall"] == 0.75
+    assert weighted_module_recall(plan_small, revealed)["weighted_module_recall"] == 0.25
+    # module_recall treats "plugins" and "docs" as equally important (1 of 2 either way).
+    assert module_recall(plan_big, revealed)["module_recall"] == 0.5
+    assert module_recall(plan_small, revealed)["module_recall"] == 0.5
+
+
+def test_weighted_module_recall_empty_inputs():
+    assert weighted_module_recall([], [])["weighted_module_recall"] == 0.0
+    assert weighted_module_recall([], [])["module_weights"] == {}
+
+
+def test_objective_score_includes_weighted_module_recall():
+    plan = [{"title": "extend plugins", "theme": "plugins", "kind": "feature"}]
+    revealed = [
+        {"subject": "big feature in plugins",
+         "files": ["plugins/a.py", "plugins/b.py", "plugins/c.py"]},
+        {"subject": "tiny tweak in docs", "files": ["docs/readme.md"]},
+    ]
+    score = objective_score(plan, revealed)
+    assert score["weighted_module_recall"] == 0.75
+    assert score["module_recall"] == 0.5
 
 
 def test_module_recall_matches_by_name():

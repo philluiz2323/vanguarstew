@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+- Composite: **file-weighted module recall is now actually computed.** `objective_component`
+  has preferred `weighted_module_recall` since 0.3.0 (#91), but nothing produced that key —
+  every replay silently fell back to plain, unweighted `module_recall`. Added
+  `module_file_weights` / `weighted_module_recall` in `benchmark/score.py` so the composite
+  score finally reflects where the revealed effort concentrated, as originally scoped in #43.
+
 ## [0.3.0] - 2026-07-03
 
 ### Added

@@ -112,18 +112,41 @@ def _plan_tokens(plan) -> set:
     return toks
 
 
+def _top_level_module(path: str):
+    """Top-level module name for a changed file path, or None for an empty path.
+
+    A path with more than one segment is keyed by its first segment (its package/
+    module). A top-level file is keyed by its name with a single extension stripped
+    (README.md -> readme); a dotfile with no extension to strip (.gitignore) falls
+    back to the bare filename sans leading dots.
+    """
+    parts = [p for p in path.split("/") if p]
+    if not parts:
+        return None
+    top = parts[0] if len(parts) > 1 else (parts[0].rsplit(".", 1)[0] or parts[0].lstrip("."))
+    return top.lower() or None
+
+
 def changed_modules(revealed) -> set:
     """Top-level modules touched across the revealed window (structural ground truth)."""
     mods = set()
     for r in revealed or []:
         for path in r.get("files", []):
-            parts = [p for p in path.split("/") if p]
-            if not parts:
-                continue
-            top = parts[0] if len(parts) > 1 else parts[0].rsplit(".", 1)[0]
+            top = _top_level_module(path)
             if top:
-                mods.add(top.lower())
+                mods.add(top)
     return mods
+
+
+def module_file_weights(revealed) -> dict:
+    """Per-module changed-file counts across the revealed window (recall weights)."""
+    weights: dict = {}
+    for r in revealed or []:
+        for path in r.get("files", []):
+            top = _top_level_module(path)
+            if top:
+                weights[top] = weights.get(top, 0) + 1
+    return weights
 
 
 def module_recall(plan, revealed) -> dict:
@@ -137,6 +160,26 @@ def module_recall(plan, revealed) -> dict:
         "module_recall": round(len(matched) / len(actual), 3),
         "actual_modules": sorted(actual),
         "matched_modules": matched,
+    }
+
+
+def weighted_module_recall(plan, revealed) -> dict:
+    """File-weighted fraction of changed-module effort the plan anticipated (#43).
+
+    Unlike `module_recall` (which weighs every touched module equally regardless of
+    how much changed there), this weights each module by how many files changed in
+    it, so a plan naming the module where most of the revealed effort concentrated
+    scores higher than one naming only a module touched by a single incidental file.
+    """
+    weights = module_file_weights(revealed)
+    if not weights:
+        return {"weighted_module_recall": 0.0, "module_weights": {}}
+    ptoks = _plan_tokens(plan)
+    total = sum(weights.values())
+    matched = sum(w for m, w in weights.items() if _tokens(m) & ptoks)
+    return {
+        "weighted_module_recall": round(matched / total, 3),
+        "module_weights": dict(sorted(weights.items())),
     }
 
 
@@ -296,6 +339,7 @@ def objective_score(plan, revealed, version_bump=None, base_version=None,
     no bump when none happened also counts as a match).
     """
     result = module_recall(plan, revealed)
+    result.update(weighted_module_recall(plan, revealed))
     result.update(kind_recall(plan, revealed))
     result.update(backlog_recall(plan, revealed, open_issues))
     signaled = release_signaled(revealed)
