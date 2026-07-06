@@ -7,6 +7,13 @@ All notable changes to this project are documented here. The format is based on
 ## [Unreleased]
 
 ### Fixed
+- Scoring robustness: `objective_score`/`_offline_rank` no longer crash when a challenger's
+  `plan` is a truthy non-list (int, bool, str, dict) instead of the `solve()` contract's
+  documented `[...]` shape. `for item in plan or []` only guarded a *falsy* `plan` — a
+  truthy non-list raised `TypeError`, and since neither `run_replay`'s per-task loop nor
+  `run_multi_replay`'s per-repo loop catches it, one malformed submission aborted the whole
+  eval run. A non-list `plan` is now normalized to empty and scored as zero substance
+  instead (#272).
 - Leakage: `agent/context.py::_context_from_git` (the fallback context builder used when
   `.vanguarstew_context.json` is absent) now filters tags with `--merged HEAD`, so a tag
   reachable only from an unmerged branch can no longer leak into `releases` as knowable-at-T.

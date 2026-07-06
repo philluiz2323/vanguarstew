@@ -101,9 +101,19 @@ def base_from_releases(releases) -> str | None:
     return best_tag
 
 
+def _plan_items(plan) -> list:
+    """Normalize a `plan` to the list the `solve()` contract promises (docs/architecture.md:
+    `"plan": [...]`). A miner's agent (or a malformed LLM response never coerced to a list)
+    can hand back a non-list truthy value -- an int, bool, str, dict -- and the ubiquitous
+    `for item in plan or []` idiom only guards against *falsy* plan, not a truthy non-list
+    one, so it crashes instead of scoring the plan as empty/no-substance.
+    """
+    return plan if isinstance(plan, list) else []
+
+
 def _plan_tokens(plan) -> set:
     toks = set()
-    for item in plan or []:
+    for item in _plan_items(plan):
         if isinstance(item, dict):
             toks |= _tokens(item.get("title", "")) | _tokens(item.get("theme", "")) \
                 | _tokens(item.get("kind", ""))
@@ -235,7 +245,7 @@ def kind_recall(plan, revealed) -> dict:
     if not actual:
         return {"kind_recall": 0.0, "actual_kinds": [], "matched_kinds": []}
     planned = {
-        plan_kind(item.get("kind", "")) for item in plan or [] if isinstance(item, dict)
+        plan_kind(item.get("kind", "")) for item in _plan_items(plan) if isinstance(item, dict)
     }
     planned.discard(None)
     matched = sorted(actual & planned)
@@ -251,7 +261,7 @@ def release_signaled(revealed) -> bool:
 
 
 def release_predicted(plan) -> bool:
-    for item in plan or []:
+    for item in _plan_items(plan):
         if isinstance(item, dict):
             # Resolve the release *kind* through the shared, case/whitespace-insensitive
             # vocabulary (as kind_recall does) instead of an exact "release" string, so a plan
@@ -405,7 +415,7 @@ def composite_score(winner: str, objective: dict, w_judge: float = 0.6,
 def trajectory_overlap(plan, revealed) -> float:
     """Jaccard overlap of plan tokens vs. revealed-commit-subject tokens. Diagnostic only."""
     plan_toks = set()
-    for item in plan or []:
+    for item in _plan_items(plan):
         if isinstance(item, dict):
             plan_toks |= _tokens(item.get("title", "")) | _tokens(item.get("theme", ""))
         else:

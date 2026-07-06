@@ -22,6 +22,7 @@ from benchmark.score import (  # noqa: E402
     plan_kind,
     release_predicted,
     release_signaled,
+    trajectory_overlap,
 )
 
 REVEALED = [
@@ -96,6 +97,42 @@ def test_empty_inputs():
     assert res["module_recall"] == 0.0
     assert objective_score([], [])["release_match"] is True  # neither signaled nor predicted
     assert backlog_recall([], [], [])["backlog_recall"] == 0.0
+
+
+def test_objective_score_tolerates_non_list_plan():
+    # #272: a miner's solve() can hand back `plan` as a truthy non-list (int, bool, str,
+    # dict) instead of the documented `[...]` shape. `plan or []` only guards a *falsy*
+    # plan, so these used to crash with `TypeError: '<type>' object is not iterable`
+    # instead of scoring as an empty/no-substance plan.
+    for bad_plan in (42, True, "a plain string", {"title": "not a list"}, 3.14):
+        score = objective_score(bad_plan, REVEALED)
+        assert score["module_recall"] == 0.0
+        assert score["kind_recall"] == 0.0
+        assert score["release_predicted"] is False
+
+
+def test_release_predicted_tolerates_non_list_plan():
+    assert release_predicted(42) is False
+    assert release_predicted("nope") is False
+
+
+def test_trajectory_overlap_tolerates_non_list_plan():
+    assert trajectory_overlap(42, REVEALED) == 0.0
+    assert trajectory_overlap({"not": "a list"}, REVEALED) == 0.0
+
+
+def test_kind_recall_tolerates_non_list_plan():
+    res = kind_recall(True, REVEALED)
+    assert res["kind_recall"] == 0.0
+    assert res["matched_kinds"] == []
+
+
+def test_objective_score_well_formed_plan_unaffected_by_non_list_guard():
+    # The non-list guard must not change scoring for the normal, well-formed case.
+    plan = [{"title": "add plugin loader", "kind": "feat", "files": ["plugins/loader.py"]}]
+    score = objective_score(plan, REVEALED)
+    assert score["matched_modules"] == ["plugins"]
+    assert score["module_recall"] > 0.0
 
 
 def test_backlog_recall_matches_addressed_issues():

@@ -104,6 +104,24 @@ def test_plan_substance_rewards_concrete_fields_and_ignores_filler():
     assert _plan_substance(concrete) > _plan_substance(filler)
 
 
+def test_plan_substance_tolerates_non_list_plan():
+    # #272: a miner's solve() can hand back `plan` as a truthy non-list (int, bool, str,
+    # dict) instead of the documented `[...]` shape. `plan or []` only guards a *falsy*
+    # plan, so these used to crash with `TypeError: '<type>' object is not iterable`
+    # instead of scoring as zero substance.
+    for bad_plan in (42, True, "a plain string", {"title": "not a list"}, 3.14):
+        assert _plan_substance(bad_plan) == 0
+
+
+def test_offline_rank_tolerates_non_list_plan_end_to_end():
+    # Same regression, exercised through the actual submission path (pairwise_judge ->
+    # _offline_rank -> _plan_substance) rather than calling the helper directly.
+    llm = LLM(api_key="offline")
+    malformed = {"philosophy": {}, "plan": 42, "rationale": ""}
+    well_formed = _sub(1, True, True)
+    assert pairwise_judge({}, malformed, well_formed, [], llm) == "B"
+
+
 def test_plan_substance_normalizes_scalar_items_through_filler_check():
     # Scalar (non-dict) items go through the same filler check: bare filler words score 0,
     # so a plan of scalar filler cannot out-rank a concrete one (regression for the review).

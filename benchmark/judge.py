@@ -101,14 +101,21 @@ def _plan_substance(plan) -> int:
     Length alone never wins: filler/blank items contribute nothing, and concrete,
     structured items are rewarded — so a shorter plan of real actions outranks a longer
     plan of generic filler.
+
+    `plan` is normalized to a list first: the `solve()` contract promises a list
+    (docs/architecture.md: `"plan": [...]`), but a miner's agent can hand back a
+    truthy non-list (int, bool, str, dict) instead. `plan or []` alone only guards
+    against a *falsy* plan, so a truthy non-list would otherwise crash `for item in
+    plan` instead of scoring as zero substance.
     """
-    return sum(_item_substance(item) for item in plan or [])
+    plan = plan if isinstance(plan, list) else []
+    return sum(_item_substance(item) for item in plan)
 
 
 def _offline_rank(submission: dict) -> tuple:
     """Deterministic stand-in ordering: reward a substantive plan plus real reasoning."""
     philosophy = submission.get("philosophy") or {}
-    plan = submission.get("plan") or []
+    plan = submission.get("plan")
     rationale = (submission.get("rationale") or "").strip()
     philosophy_signal = 1 if isinstance(philosophy, dict) and any(
         philosophy.get(k) for k in ("summary", "direction", "values")) else 0

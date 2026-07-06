@@ -63,6 +63,33 @@ def test_single_run_reports_composite_mean_and_parts():
         shutil.rmtree(d, ignore_errors=True)
 
 
+_MALFORMED_PLAN_AGENT = '''
+def solve(repo_path, request, model=None, api_base=None, api_key=None, n=5, **_):
+    return {"philosophy": {}, "plan": 42, "action": "plan", "patch": None, "rationale": ""}
+'''
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git required")
+def test_run_replay_survives_a_non_list_plan_from_the_challenger():
+    # #272: a challenger agent returning `plan` as a truthy non-list (here, an int) used to
+    # crash `objective_score`/`_offline_rank` with an uncaught TypeError, aborting the whole
+    # replay run instead of just scoring that task low.
+    d = _tiny_repo(tempfile.mkdtemp())
+    agent_dir = tempfile.mkdtemp()
+    try:
+        agent_file = os.path.join(agent_dir, "agent.py")
+        with open(agent_file, "w", encoding="utf-8") as f:
+            f.write(_MALFORMED_PLAN_AGENT)
+
+        res = run_replay(d, agent_file=agent_file, n_tasks=2, horizon=3, seed=0)
+
+        assert res["tasks"] == 2
+        assert all(r["objective"]["module_recall"] == 0.0 for r in res["rows"])
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+        shutil.rmtree(agent_dir, ignore_errors=True)
+
+
 @pytest.mark.skipif(shutil.which("git") is None, reason="git required")
 def test_multi_repo_aggregates_and_is_deterministic():
     a = _tiny_repo(tempfile.mkdtemp(), prefix="alpha")
