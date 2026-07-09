@@ -143,6 +143,21 @@ def test_min_runs_is_configurable():
     assert assess_repeatability(runs, min_runs=3)["stable"] is False   # 2 < 3 -> inconclusive
 
 
+def test_no_scored_runs_is_inconclusive_not_a_crash_with_low_min_runs():
+    # min_runs <= 0 must not let an empty/unscored artifact set fall through to mean([]) and
+    # raise: a run with no usable score is skipped, not fatal (module contract). The `runs <
+    # min_runs` guard alone does not cover this because 0 < 0 (or 0 < -1) is False.
+    for min_runs in (0, -1):
+        for artifacts in ([], [{"error": "no tasks"}, "not-a-dict"]):
+            result = assess_repeatability(artifacts, min_runs=min_runs)
+            assert result["runs"] == 0
+            assert result["scores"] == []
+            assert result["stable"] is False
+            assert result["mean"] is None
+            assert result["cv"] is None
+            assert result["reason"] == "no scored runs"
+
+
 def test_a_realistic_five_repeat_acceptance_run():
     # Five tight repeats of a generalization acceptance run read stable and report the spread.
     result = assess_repeatability([_gen(s) for s in (0.61, 0.60, 0.62, 0.61, 0.60)], max_cv=0.05)

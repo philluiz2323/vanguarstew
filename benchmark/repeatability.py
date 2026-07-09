@@ -89,6 +89,14 @@ def assess_repeatability(artifacts, max_cv: float = DEFAULT_MAX_CV,
         result["reason"] = f"insufficient runs: {runs} scored < min_runs {min_runs}"
         return result
 
+    # No artifact carried a usable score. `runs < min_runs` does not catch this when
+    # min_runs <= 0, and mean([]) raises StatisticsError — which would break the documented
+    # "an artifact with no usable score is skipped rather than raising" contract. Guard it so an
+    # empty/unscored artifact set returns cleanly regardless of min_runs.
+    if not scores:
+        result["reason"] = "no scored runs"
+        return result
+
     mu = round(mean(scores), 3)
     # The repeats are a *sample* of a noisy run — the CV estimates run-to-run spread to decide
     # reproducibility, so use the sample (Bessel-corrected) standard deviation. Population stddev
