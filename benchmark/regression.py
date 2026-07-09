@@ -102,10 +102,25 @@ def _round(value):
     return round(float(value), 3) if _is_number(value) else None
 
 
-def _partition_disagreement_counts(part: dict) -> tuple[int, int] | None:
-    """Disagree/dual-order counts from one partition, preferring ``judge_order_stats``."""
-    part = _dict(part)
-    for telemetry in (_dict(part.get("judge_order_stats")), _dict(part.get("judge_report"))):
+# A telemetry block that is present but internally impossible (``disagree > dual_order_tasks``).
+# Distinct from ``None`` ("no usable dual-order telemetry"), which merely contributes nothing to a
+# pooled rate: an impossible block means the artifact's order telemetry is corrupt, so any rate
+# derived from it must be withheld rather than silently dropped or diluted.
+_INCOHERENT = object()
+
+
+def _order_counts(source: dict):
+    """Disagree/dual-order counts from one telemetry-carrying block, preferring ``judge_order_stats``.
+
+    Returns ``(disagreements, dual_order_tasks)`` for coherent counts, :data:`_INCOHERENT` when a
+    block carries counts that cannot both be true (``disagreements > dual_order_tasks``, which would
+    yield a rate above 1.0), and ``None`` when no block carries usable dual-order counts at all.
+
+    ``judge_order_stats`` is authoritative: when it is present but impossible we report
+    :data:`_INCOHERENT` immediately rather than falling back to a (possibly stale) ``judge_report``.
+    """
+    source = _dict(source)
+    for telemetry in (_dict(source.get("judge_order_stats")), _dict(source.get("judge_report"))):
         if not telemetry:
             continue
         dual = telemetry.get("dual_order_tasks")
@@ -119,13 +134,26 @@ def _partition_disagreement_counts(part: dict) -> tuple[int, int] | None:
         if disagreements is None:
             disagreements = telemetry.get("disagreements")
         if _is_int(dual) and dual > 0 and _is_int(disagreements) and disagreements >= 0:
+            if disagreements > dual:
+                return _INCOHERENT
             return int(disagreements), int(dual)
     return None
 
 
 def _flat_disagreement(artifact: dict) -> float | None:
-    """Order-disagreement rate for a flat artifact, preferring ``judge_order_stats``."""
+    """Order-disagreement rate for a flat artifact, preferring ``judge_order_stats``.
+
+    Impossible counts yield ``None`` rather than a rate above 1.0, and never fall back to a reported
+    ``disagreement_rate`` — corrupt counts must not be papered over by a stale rate. The reported
+    rate is still used when the artifact carries no dual-order counts to recompute from.
+    """
     artifact = _dict(artifact)
+    counts = _order_counts(artifact)
+    if counts is _INCOHERENT:
+        return None
+    if counts is not None:
+        disagreements, dual = counts
+        return round(disagreements / dual, 3)
     for telemetry in (_dict(artifact.get("judge_order_stats")), _dict(artifact.get("judge_report"))):
         if not telemetry:
             continue
@@ -144,8 +172,15 @@ def _disagreement(artifact) -> float | None:
         total_dis = 0
         total_dual = 0
         for label in ("tuned", "held_out"):
-            counts = _partition_disagreement_counts(_dict(artifact.get(label)))
+            counts = _order_counts(_dict(artifact.get(label)))
+            if counts is _INCOHERENT:
+                # A coherent partition would dilute the impossible one into a plausible-but-wrong
+                # pooled rate (which a rate-range check on the overall cannot catch), so surface the
+                # corruption instead of pooling it.
+                return None
             if counts is None:
+                # No dual-order telemetry: this partition contributes nothing to the pooled rate,
+                # which stays the correct rate over the dual-order tasks that do exist.
                 continue
             dis, dual = counts
             total_dis += dis
