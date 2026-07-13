@@ -8,6 +8,8 @@ import subprocess
 import sys
 import tempfile
 
+import pytest
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -276,6 +278,84 @@ def test_cli_missing_file_exits_two():
         text=True,
     )
     assert proc.returncode == 2
+    assert "artifact not found" in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+def test_cli_permission_denied_exits_two(tmp_path):
+    good = tmp_path / "good.json"
+    good.write_text("{}", encoding="utf-8")
+    unreadable = tmp_path / "unreadable.json"
+    unreadable.write_text("{}", encoding="utf-8")
+    unreadable.chmod(0o000)
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "scripts.objective_integrity", str(unreadable)],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+    finally:
+        unreadable.chmod(0o644)
+    assert proc.returncode == 2
+    assert "not readable" in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
+def test_cli_directory_path_exits_two(tmp_path):
+    proc = subprocess.run(
+        [sys.executable, "-m", "scripts.objective_integrity", str(tmp_path)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 2
+    assert "directory, not a file" in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
+def test_cli_broken_symlink_exits_two(tmp_path):
+    link = tmp_path / "dangling.json"
+    link.symlink_to(tmp_path / "does-not-exist.json")
+    proc = subprocess.run(
+        [sys.executable, "-m", "scripts.objective_integrity", str(link)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 2
+    assert "Traceback" not in proc.stderr
+    # A broken symlink resolves to FileNotFoundError on open()
+    assert "artifact not found" in proc.stderr
+
+
+def test_cli_invalid_json_exits_two(tmp_path):
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not valid json", encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, "-m", "scripts.objective_integrity", str(bad)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 2
+    assert "not valid JSON" in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
+def test_cli_non_object_json_exits_two(tmp_path):
+    arr = tmp_path / "arr.json"
+    arr.write_text("[1, 2, 3]", encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, "-m", "scripts.objective_integrity", str(arr)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 2
+    assert "must be a JSON object" in proc.stderr
+    assert "Traceback" not in proc.stderr
 
 
 def test_weighted_recall_preferred_when_valid():
@@ -298,3 +378,87 @@ def test_check_does_not_mutate_input():
     snap = copy.deepcopy(art)
     check_objective_integrity(art)
     assert art == snap
+
+
+def test_corrupt_string_per_repo_row_fails_closed():
+    # A per_repo row serialized as a raw error string (not a result dict) is silently dropped by
+    # _per_repo_list, so a partial artifact with one clean scored repo used to pass as CONSISTENT.
+    # It must fail closed instead -- matching run_clean (#1357), error_repo_share (#1362), and
+    # tally_integrity (#1453).
+    art = {"per_repo": [_artifact(), "CLONE FAILED: fatal"]}
+    result = check_objective_integrity(art)
+    assert result["passed"] is False
+    assert "per_repo_rows_wellformed" in failed_checks(result)
+
+
+def test_corrupt_string_row_in_generalization_partition_fails_closed():
+    held = _artifact()
+    held["scored_repos"] = 1
+    report = {
+        "generalization_gap": 0.0,
+        "tuned": {"per_repo": [_artifact(), "boom"]},
+        "held_out": held,
+    }
+    result = check_objective_integrity(report)
+    assert result["passed"] is False
+    assert "per_repo_rows_wellformed" in failed_checks(result)
+
+
+def test_wellformed_per_repo_rows_pass_the_check():
+    # Control: an int row and a whitespace-only string are ignored (not corrupt) -- only a
+    # non-empty string is flagged -- so a clean multi-repo run stays CONSISTENT and reports the
+    # well-formedness check as passing.
+    art = {"per_repo": [_artifact(), 42, "   "]}
+    result = check_objective_integrity(art)
+    assert result["passed"] is True
+    assert "per_repo_rows_wellformed" in _names(result)
+    assert "per_repo_rows_wellformed" not in failed_checks(result)
+
+
+def test_corrupt_string_row_in_held_out_partition_fails_closed():
+    # BOTH generalization partitions are scanned, not just tuned: a corrupt string row in the
+    # held_out partition's per_repo must also fail closed.
+    tuned = _artifact()
+    tuned["scored_repos"] = 1
+    report = {
+        "generalization_gap": 0.0,
+        "tuned": tuned,
+        "held_out": {"per_repo": [_artifact(), "held-out boom"]},
+    }
+    result = check_objective_integrity(report)
+    assert result["passed"] is False
+    assert "per_repo_rows_wellformed" in failed_checks(result)
+
+
+def test_non_list_per_repo_is_not_masked():
+    # A per_repo that is not a list is not silently accepted: it yields no scored slice, so the
+    # gate still fails closed via artifact_shape (the well-formedness check is simply not added,
+    # matching _per_repo_list, which warns and treats a non-list per_repo as empty).
+    result = check_objective_integrity({"per_repo": "CLONE FAILED"})
+    assert result["passed"] is False
+    assert "artifact_shape" in failed_checks(result)
+
+
+def test_partition_missing_per_repo_does_not_hide_a_corrupt_row_in_the_other():
+    # A generalization partition that is missing its per_repo key must not suppress detection --
+    # the other partition's per_repo is still scanned, in BOTH directions. The helper returns None
+    # only when NEITHER partition carries a per_repo list (no rows to scan at all), never when a
+    # corrupt row is present, so "no per_repo rows" and "scan skipped" never diverge in a way that
+    # lets a corrupt row through.
+    tuned_corrupt = {
+        "generalization_gap": 0.0,
+        "tuned": {"per_repo": [_artifact(), "boom"]},   # corrupt row here
+        "held_out": _artifact(),                          # no per_repo key (top-level rows)
+    }
+    tuned_corrupt["held_out"]["scored_repos"] = 1
+    r1 = check_objective_integrity(tuned_corrupt)
+    assert r1["passed"] is False and "per_repo_rows_wellformed" in failed_checks(r1)
+
+    held_corrupt = {
+        "generalization_gap": 0.0,
+        "tuned": _artifact(),                             # no per_repo key (top-level rows)
+        "held_out": {"per_repo": [_artifact(), "boom"]},  # corrupt row here
+    }
+    held_corrupt["tuned"]["scored_repos"] = 1
+    r2 = check_objective_integrity(held_corrupt)
+    assert r2["passed"] is False and "per_repo_rows_wellformed" in failed_checks(r2)

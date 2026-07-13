@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+from unittest.mock import patch
 
 import pytest
 
@@ -116,6 +117,107 @@ def test_malformed_per_repo_still_counts_valid_rows():
            "scored_repos": 1, "skipped": 0}
     out = snapshot(art)
     assert out["tasks"] == 4
+    assert out["has_error"] is True
+
+
+def test_bare_string_per_repo_row_sets_has_error():
+    art = _multi("ok")
+    art["per_repo"].append("corrupt row")
+    out = snapshot(art)
+    assert out["has_error"] is True
+    assert "status=error" in snapshot_headline(out)
+
+
+def test_blank_string_per_repo_row_does_not_set_has_error():
+    art = _multi("ok")
+    art["per_repo"].append("   ")
+    out = snapshot(art)
+    assert out["has_error"] is False
+
+
+def test_generalization_partition_bare_string_per_repo_sets_has_error():
+    art = _gen()
+    art["tuned"]["per_repo"].append("corrupt")
+    out = snapshot(art)
+    assert out["has_error"] is True
+
+
+def test_has_error_tolerates_missing_per_repo_and_non_list_per_repo():
+    assert snapshot(_multi("a"))["has_error"] is False
+    art = {"per_repo": "oops", "composite_mean": 0.5, "repos": 1, "scored_repos": 1, "skipped": 0}
+    out = snapshot(art)
+    assert out["has_error"] is False
+
+
+def test_has_error_per_repo_none_does_not_crash():
+    art = {"composite_mean": 0.5, "repos": 1, "scored_repos": 1, "skipped": 0, "per_repo": None}
+    assert snapshot(art)["has_error"] is False
+
+
+def test_has_error_per_repo_with_none_and_non_dict_entries_does_not_crash():
+    art = {"per_repo": [_repo("a"), None, 42], "composite_mean": 0.5, "repos": 1,
+           "scored_repos": 1, "skipped": 0}
+    assert snapshot(art)["has_error"] is False
+
+
+def test_falsy_per_repo_error_values_do_not_set_has_error():
+    for falsy in (0, False, None, ""):
+        art = _multi("ok")
+        art["per_repo"].append({"repo": "x", "tasks": 0, "error": falsy})
+        assert snapshot(art)["has_error"] is False, falsy
+
+
+def test_non_finite_top_level_tasks_snapshots_none_instead_of_raising():
+    # Previously ValueError/OverflowError from int(float("nan"))/int(float("inf")) in _task_total.
+    # A NaN/Infinity count survives a JSON round trip but is not usable -- report None, don't crash.
+    for bad in (float("nan"), float("inf")):
+        out = snapshot({"composite_mean": 0.5, "tasks": bad})   # must not raise
+        assert out["tasks"] is None, bad
+
+
+def test_non_finite_per_repo_tasks_are_skipped_not_crashing():
+    # A non-finite per_repo tasks row is skipped like any malformed row; a coherent row still counts.
+    art = {"per_repo": [{"repo": "a", "tasks": float("inf")}, _repo("b", tasks=4)],
+           "composite_mean": 0.5, "repos": 1, "scored_repos": 1, "skipped": 0}
+    out = snapshot(art)          # must not raise
+    assert out["tasks"] == 4
+
+
+def test_non_finite_tasks_never_raise_for_any_variant():
+    # NaN, +/-Infinity, and an int too large for a float all survive a JSON round trip and would
+    # crash int(); none may raise, at the top level or inside a per_repo/generalization slice.
+    for bad in (float("nan"), float("inf"), float("-inf"), 10**400):
+        assert isinstance(snapshot({"composite_mean": 0.5, "tasks": bad}), dict), bad
+        assert isinstance(snapshot({"per_repo": [{"repo": "a", "tasks": bad}]}), dict), bad
+        gen = {"tuned": {"per_repo": [{"repo": "t", "tasks": bad}]},
+               "held_out": {"per_repo": [{"repo": "h", "tasks": 3}]},
+               "generalization_gap": 0.1}
+        assert isinstance(snapshot(gen), dict), bad
+
+
+def test_non_finite_generalization_gap_snapshots_none():
+    # A non-finite generalization_gap must not be emitted into the snapshot (NaN/Infinity are not
+    # valid JSON and not usable numbers); it degrades to None like any other unavailable value.
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        art = {"tuned": {"composite_mean": 0.6, "scored_repos": 2, "per_repo": [{"tasks": 3}]},
+               "held_out": {"composite_mean": 0.5, "scored_repos": 1, "per_repo": [{"tasks": 2}]},
+               "generalization_gap": bad}
+        assert snapshot(art)["generalization_gap"] is None, bad
+
+
+def test_non_finite_decisive_margin_snapshots_none():
+    # decisive_margin is likewise withheld when non-finite rather than propagated into the snapshot.
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        out = snapshot({"composite_mean": 0.6, "tasks": 3, "decisive_margin": bad})
+        assert out["decisive_margin"] is None, bad
+
+
+def test_non_finite_composite_is_unscored_without_raising():
+    # A non-finite headline composite is treated as unscored (via the hardened trend reader); the
+    # snapshot and its headline never raise.
+    out = snapshot({"composite_mean": float("inf"), "tasks": 3})
+    assert out["scored"] is False and out["headline_score"] is None
+    snapshot_headline(out)   # must not raise
 
 
 def test_invalid_artifact_kind():
@@ -163,3 +265,25 @@ def test_cli_missing_file_exits_two(tmp_artifact, capsys):
     good = tmp_artifact("good.json", _single())
     assert cli.run([good, "missing.json"]) == 2
     assert "not found" in capsys.readouterr().err
+
+
+def test_cli_directory_path_exits_two(tmp_path, capsys):
+    # A directory path raises IsADirectoryError inside open(); the CLI must report it cleanly and
+    # exit 2, not dump a raw traceback (mirrors generalization_gate #1446 / objective_integrity #1377).
+    assert cli.run([str(tmp_path)]) == 2
+    assert "directory" in capsys.readouterr().err
+
+
+def test_cli_unreadable_file_exits_two(capsys):
+    # An unreadable file raises PermissionError; the CLI reports it cleanly and exits 2.
+    with patch("builtins.open", side_effect=PermissionError("denied")):
+        assert cli.run(["locked.json"]) == 2
+    assert "not readable" in capsys.readouterr().err
+
+
+def test_cli_generic_os_error_exits_two(capsys):
+    # Any other OSError (e.g. an I/O error) is reported cleanly with its message, not a traceback.
+    with patch("builtins.open", side_effect=OSError("I/O error")):
+        assert cli.run(["flaky.json"]) == 2
+    err = capsys.readouterr().err
+    assert "cannot read artifact" in err and "I/O error" in err

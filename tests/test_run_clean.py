@@ -65,6 +65,36 @@ def test_partition_error_in_generalization():
     assert result["passed"] is False
 
 
+def test_malformed_string_per_repo_row_fails():
+    # A per_repo row that is itself a non-empty string is a malformed/corrupt entry, not a
+    # well-formed result dict — it must fail closed (aligned with acceptance._partition_error),
+    # not slip through as clean.
+    art = _multi("ok")
+    art["per_repo"].append("corrupt row")
+    result = check_run_clean(art)
+    assert result["passed"] is False
+    assert any("malformed row" in f for f in result["findings"])
+
+
+def test_malformed_string_per_repo_row_fails_under_generalization():
+    tuned = _multi("a")
+    tuned["per_repo"].append("boom")
+    art = {"tuned": tuned, "held_out": _multi("b"), "generalization_gap": 0.0}
+    result = check_run_clean(art)
+    assert result["passed"] is False
+    assert any("tuned.per_repo" in f and "malformed row" in f for f in result["findings"])
+
+
+def test_empty_string_and_non_str_non_dict_per_repo_rows_are_ignored():
+    # Empty/whitespace string rows and non-dict/non-string rows carry no error signal and are
+    # ignored (same as acceptance._partition_error), so an otherwise-clean run still passes.
+    art = _multi("ok")
+    art["per_repo"] += ["", "   ", 42, None, ["x"]]
+    result = check_run_clean(art)
+    assert result["passed"] is True
+    assert result["findings"] == []
+
+
 def test_headline():
     assert "OK" in run_clean_headline(check_run_clean(_multi("a")))
     assert "ERRORS" in run_clean_headline(check_run_clean({"error": "x"}))
@@ -89,6 +119,13 @@ def test_cli_strict(tmp_artifact, capsys):
 def test_cli_without_strict_exits_zero_on_error(tmp_artifact):
     path = tmp_artifact("dirty.json", {"error": "fail"})
     assert cli.run([path]) == 0
+
+
+def test_cli_directory_path_exits_two(tmp_path, capsys):
+    # A directory path raises IsADirectoryError inside open(); the CLI must report it cleanly and
+    # exit 2, not dump a raw traceback (mirrors generalization_gate #1446 / objective_integrity #1377).
+    assert cli.run([str(tmp_path)]) == 2
+    assert "directory" in capsys.readouterr().err
 
 
 def test_failed_checks_helper_is_robust():

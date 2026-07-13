@@ -16,6 +16,7 @@ Pure analysis: no I/O, never mutates its input, and missing telemetry yields ``N
 from __future__ import annotations
 
 import logging
+import math
 
 from benchmark.comparability import artifact_kind
 from benchmark.trend import headline_score
@@ -24,7 +25,19 @@ logger = logging.getLogger(__name__)
 
 
 def _is_number(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    """Only a finite, non-boolean int/float counts as numeric.
+
+    ``math.isfinite`` raises ``OverflowError`` for a Python ``int`` too large to convert to a
+    ``float`` (a hand-edited or degenerate artifact's ``composite_mean``); guard it the same
+    way every other ``_is_number`` in this codebase does (``acceptance``, ``component_floor``,
+    ``composite_spread``) instead of crashing outright.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _dict(value) -> dict:

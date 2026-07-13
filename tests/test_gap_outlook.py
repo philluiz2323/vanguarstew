@@ -86,3 +86,46 @@ def test_cli(tmp_artifact, capsys):
     assert cli.run([path]) == 0
     body = json.loads(capsys.readouterr().out)
     assert body["verdict"] == "unfavorable"
+
+
+def test_cli_directory_path_exits_two(tmp_path, capsys):
+    # A directory artifact path is an OSError (IsADirectoryError on POSIX, PermissionError on
+    # Windows), not a FileNotFoundError -- it must exit 2 with an actionable message, not a raw
+    # traceback.
+    assert cli.run([str(tmp_path)]) == 2
+    err = capsys.readouterr().err
+    assert "directory" in err or "not readable" in err
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_composite_mean_degrades_to_na(bad):
+    # json.dump/json.load round-trip NaN/Infinity verbatim, so a hand-edited or degenerate
+    # artifact can carry a non-finite composite_mean. It is not a real score: the partition
+    # scores None, the recomputed gap is None, the verdict is unknown, and the headline degrades
+    # to "n/a" rather than surfacing "nan"/"inf" (mirrors benchmark/trend.py and skip_share.py).
+    from benchmark.gap_outlook import _partition_score
+
+    assert _partition_score({"composite_mean": bad, "scored_repos": 2}) is None
+    out = summarize_gap_outlook(_gen(bad, 0.5, 0.1))
+    assert out["generalization_gap"] is None
+    assert out["tuned_score"] is None
+    assert out["verdict"] is None
+    headline = gap_outlook_headline(out)
+    assert "nan" not in headline
+
+
+def test_oversized_int_composite_mean_degrades_to_na_instead_of_crashing():
+    # math.isfinite() raises OverflowError for a Python int too large to convert to a float
+    # (a hand-edited or degenerate artifact's composite_mean) -- must degrade the same way a
+    # NaN/Infinity value does, not crash outright.
+    from benchmark.gap_outlook import _is_number, _partition_score
+
+    assert _is_number(10**400) is False
+    assert _partition_score({"composite_mean": 10**400, "scored_repos": 2}) is None
+    out = summarize_gap_outlook(_gen(10**400, 0.5, 0.1))
+    assert out["generalization_gap"] is None
+    assert out["tuned_score"] is None
+    assert out["verdict"] is None
+    headline = gap_outlook_headline(out)
+    assert "n/a" in headline
+    assert "n/a" in headline

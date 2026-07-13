@@ -14,6 +14,10 @@ os.environ["VANGUARSTEW_OFFLINE"] = "1"
 
 from agent.llm import LLM  # noqa: E402
 from agent.planner import (  # noqa: E402
+    OBJECTIVE_ANCHOR_GUIDANCE,
+    PLAN_ITEM_SCHEMA,
+    RELEASE_CADENCE_GUIDANCE,
+    _commit_plan_kind,
     _explicit_pr_number,
     _is_review_item,
     _matched_pr,
@@ -26,6 +30,9 @@ from agent.planner import (  # noqa: E402
     _pr_number,
     _pr_queue_note,
     _pr_title,
+    _recent_kinds_note,
+    _release_cadence_note,
+    _release_cadence_signal,
     _safe_prs,
     _significant_tokens,
     plan_next_actions,
@@ -728,3 +735,136 @@ def test_review_verb_governs_number_across_an_action_verb():
     out = reconcile_plan_with_queue([{"title": "Merge and land #7", "kind": "triage"}],
                                     {"open_prs": prs}, 5)
     assert [o["title"] for o in out] == ["Merge and land #7"]
+
+
+class _PromptCaptureLLM:
+    def __init__(self, payload):
+        self.payload = payload
+        self.last_user = ""
+
+    def chat_json(self, system, user, stub=None):
+        self.last_user = user
+        return self.payload
+
+
+def test_plan_prompt_includes_objective_anchor_guidance():
+    llm = _PromptCaptureLLM([{"title": "Fix loader race", "kind": "bugfix", "files": ["core/loader.py"]}])
+    plan_next_actions({"open_prs": []}, {}, 1, llm)
+    assert PLAN_ITEM_SCHEMA.strip() in llm.last_user
+    assert OBJECTIVE_ANCHOR_GUIDANCE in llm.last_user
+    assert '"files"' in llm.last_user
+    assert RELEASE_CADENCE_GUIDANCE not in llm.last_user
+
+
+def test_release_cadence_signal_detects_release_subjects():
+    ctx = {"recent_commits": [{"subject": "feat: add export"}, {"subject": "chore(release): 1.4.0"}]}
+    assert _release_cadence_signal(ctx) is True
+    assert _release_cadence_signal({"recent_commits": [{"subject": "fix: loader"}]}) is False
+    assert _release_cadence_signal({}) is False
+
+
+def test_release_cadence_note_only_when_history_signals_cadence():
+    assert _release_cadence_note({}) == ""
+    note = _release_cadence_note({"recent_commits": [{"subject": "release: 2.0"}]})
+    assert RELEASE_CADENCE_GUIDANCE in note
+
+
+def test_planner_prompt_includes_release_cadence_only_with_history():
+    captured = {}
+
+    class CapturingLLM(LLM):
+        def chat_json(self, system, user, stub=None):
+            captured["user"] = user
+            return [{"title": "Fix loader", "kind": "bugfix"}]
+
+    plan_next_actions({"open_prs": [], "recent_commits": [{"subject": "fix: a"}]},
+                      {}, 2, CapturingLLM(api_key="offline"))
+    assert RELEASE_CADENCE_GUIDANCE not in captured["user"]
+
+    plan_next_actions({"open_prs": [], "recent_commits": [{"subject": "chore(release): 1.0.0"}]},
+                      {}, 2, CapturingLLM(api_key="offline"))
+    assert RELEASE_CADENCE_GUIDANCE in captured["user"]
+
+
+
+def test_commit_plan_kind_maps_conventional_prefixes_to_plan_vocabulary():
+    assert _commit_plan_kind("feat: add exporter") == "feature"
+    assert _commit_plan_kind("fix(parser)!: handle empty input") == "bugfix"
+    assert _commit_plan_kind("docs: document the flag") == "docs"
+    assert _commit_plan_kind("refactor: split the loader") == "refactor"
+    assert _commit_plan_kind("chore: tidy the Makefile") == "dep"
+    assert _commit_plan_kind("deps: bump lodash") == "dep"
+    assert _commit_plan_kind("release: 2.0") == "release"
+
+
+def test_commit_plan_kind_release_tooling_cut_reads_as_release_not_dep():
+    # standard-version / release-please author the cut under chore/build (mirrors the
+    # objective anchor's classification in benchmark/score.py).
+    assert _commit_plan_kind("chore(release): 1.4.0") == "release"
+    assert _commit_plan_kind("chore(main): release 1.2.3") == "release"
+    assert _commit_plan_kind("build(release): v2.0.0") == "release"
+    # An ordinary chore stays dep; an ordinary build has no plan-kind equivalent.
+    assert _commit_plan_kind("chore: update editorconfig") == "dep"
+    assert _commit_plan_kind("build: switch to bazel") is None
+
+
+def test_commit_plan_kind_drops_unexpressible_and_unknown_subjects():
+    # Types the plan "kind" vocabulary cannot express are dropped, not mis-binned.
+    assert _commit_plan_kind("test: cover the loader race") is None
+    assert _commit_plan_kind("ci: cache pip downloads") is None
+    assert _commit_plan_kind("perf: memoize the tokenizer") is None
+    # Merge commits, prefix-less subjects, and non-strings carry no kind.
+    assert _commit_plan_kind("Merge pull request from fork/branch") is None
+    assert _commit_plan_kind("Add streaming export") is None
+    assert _commit_plan_kind(None) is None
+    assert _commit_plan_kind(123) is None
+
+
+def test_recent_kinds_note_orders_by_frequency_then_name():
+    ctx = {"recent_commits": [
+        {"subject": "fix: a"}, {"subject": "fix(x): b"},
+        {"subject": "docs: c"}, {"subject": "docs: d"},
+        {"subject": "feat: e"},
+        {"subject": "Merge branch 'main'"},   # no kind — ignored
+        "not-a-dict",                          # malformed entry — ignored
+        {"subject": None},                     # non-string subject — ignored
+    ]}
+    note = _recent_kinds_note(ctx)
+    assert "bugfix (2), docs (2), feature (1)" in note
+
+
+def test_recent_kinds_note_empty_when_no_signal():
+    assert _recent_kinds_note({}) == ""
+    assert _recent_kinds_note({"recent_commits": "not-a-list"}) == ""
+    assert _recent_kinds_note({"recent_commits": [{"subject": "plain subject line"}]}) == ""
+
+
+def test_planner_prompt_surfaces_recent_kind_mix():
+    captured = {}
+
+    class CapturingLLM(LLM):
+        def chat_json(self, system, user, stub=None):
+            captured["user"] = user
+            return [{"title": "Fix the loader race", "kind": "bugfix",
+                     "rationale": "recent history is fix-heavy", "theme": "stability"}]
+
+    ctx = {"open_prs": [], "recent_commits": [
+        {"subject": "fix: loader race"}, {"subject": "feat: exporter"},
+    ]}
+    out = plan_next_actions(ctx, {}, 3, CapturingLLM(api_key="offline"))
+    assert "Recent maintainer activity by kind" in captured["user"]
+    assert "bugfix (1)" in captured["user"] and "feature (1)" in captured["user"]
+    assert out and out[0]["kind"] == "bugfix"
+
+
+def test_planner_prompt_omits_kind_note_without_conventional_commits():
+    captured = {}
+
+    class CapturingLLM(LLM):
+        def chat_json(self, system, user, stub=None):
+            captured["user"] = user
+            return [{"title": "Write user documentation", "kind": "docs"}]
+
+    ctx = {"open_prs": [], "recent_commits": [{"subject": "Add streaming export"}]}
+    plan_next_actions(ctx, {}, 3, CapturingLLM(api_key="offline"))
+    assert "Recent maintainer activity by kind" not in captured["user"]

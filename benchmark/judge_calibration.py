@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from pathlib import Path
 
 from agent.llm import LLM
@@ -176,8 +177,14 @@ def check_calibration(corpus: list[dict] | None = None, llm: LLM | None = None) 
         "scenario_count": len(results),
         "results": results,
         "symmetry_checks": symmetry,
-        "failed": [r["id"] for r in results if not r["passed"]]
-               + [s["id"] for s in symmetry if not s["passed"]],
+        # ``failed`` is the set of scenario ids that failed ANY check. A scenario runs through both
+        # the winner check (``results``) and the symmetry check (``symmetry``) under the same id, so
+        # one that fails both must be listed once, not twice -- dedup preserving first-seen order
+        # (mirrors score_calibration, whose single-source ``failed`` never duplicates).
+        "failed": list(dict.fromkeys(
+            [r["id"] for r in results if not r["passed"]]
+            + [s["id"] for s in symmetry if not s["passed"]]
+        )),
     }
 
 
@@ -308,11 +315,32 @@ def failed_scenarios(result: dict) -> list[str]:
     return _failed_ids_list(result.get("failed"))
 
 
+def _is_number(value) -> bool:
+    """Only a finite, non-boolean int/float counts as numeric.
+
+    ``json`` round-trips ``NaN``/``Infinity`` verbatim and a large JSON integer loads as an
+    arbitrary-precision ``int``, so a hand-built or degenerate calibration artifact can carry
+    a non-finite, oversized, or non-numeric ``scenario_count``. A bare ``int()`` on it raised
+    (``OverflowError`` for infinity/an oversized int, ``ValueError`` for ``NaN``,
+    ``TypeError`` for a truthy non-number) instead of the headline degrading the way it
+    already does for every other malformed field (#1497). Mirrors the identical guard in
+    this module's documented twin, ``score_calibration`` (#1490). ``OverflowError`` in the
+    probe guards an int too large to convert to a float.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, OverflowError):
+        return False
+
+
 def calibration_headline(result: dict) -> str:
     """One-line human summary of a :func:`check_calibration` result."""
     if not isinstance(result, dict):
         return "calibration: no scenarios evaluated"
-    count = int(result.get("scenario_count") or 0)
+    raw_count = result.get("scenario_count")
+    count = int(raw_count) if _is_number(raw_count) else 0
     if count == 0:
         return "calibration: no scenarios evaluated"
     if result.get("passed"):

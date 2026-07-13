@@ -11,7 +11,9 @@ returning ``None`` for unavailable values rather than raising.
 from __future__ import annotations
 
 import logging
+import math
 
+from benchmark.acceptance import _partition_error
 from benchmark.comparability import artifact_kind
 from benchmark.trend import headline_score
 
@@ -19,7 +21,17 @@ logger = logging.getLogger(__name__)
 
 
 def _is_number(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    # Non-finite floats survive a save/load round trip (json.dump writes NaN/Infinity and
+    # json.load parses them back), but int() raises on them and a NaN/Infinity count is not
+    # a usable value anyway -- treat them as malformed, like a missing or wrong-typed field,
+    # matching row_integrity.py (#616/#927). math.isfinite also raises OverflowError for ints
+    # too large for a float, which would crash int()/formatting the same way.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 def _is_int(value) -> bool:
@@ -95,22 +107,11 @@ def _has_error(artifact: dict) -> bool:
     kind = artifact_kind(artifact)
     if kind == "generalization":
         for part in ("tuned", "held_out"):
-            if _dict(artifact.get(part)).get("error"):
+            if _partition_error(_dict(artifact.get(part))):
                 return True
-        containers = [
-            _dict(artifact.get("tuned")).get("per_repo"),
-            _dict(artifact.get("held_out")).get("per_repo"),
-        ]
-    elif kind == "multi":
-        containers = [artifact.get("per_repo")]
-    else:
         return False
-    for per_repo in containers:
-        if not isinstance(per_repo, list):
-            continue
-        for entry in per_repo:
-            if isinstance(entry, dict) and entry.get("error"):
-                return True
+    if kind == "multi":
+        return _partition_error({"per_repo": artifact.get("per_repo")}) is not None
     return False
 
 

@@ -36,6 +36,7 @@ the relevant checks rather than raising.
 from __future__ import annotations
 
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,21 @@ DEFAULT_MIN_DUAL_ORDER_TASKS = 2
 
 
 def _is_number(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    """Only a finite, non-boolean int/float counts as numeric.
+
+    ``json`` round-trips ``NaN``/``Infinity`` verbatim, so a hand-edited or degenerate artifact can
+    carry a non-finite ``dual_order_tasks``. Without the finite guard an ``Infinity``
+    ``dual_order_tasks`` trivially clears ``enough_dual_order_tasks`` (``inf >= min`` is ``True``),
+    passing the judge-robustness gate on a malformed run. Treating a non-finite value as
+    non-numeric fails that check closed instead, matching ``score_integrity`` (#1336),
+    ``artifact_snapshot`` (#1316), and ``component_floor``. ``OverflowError`` guards an oversized int.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, OverflowError):
+        return False
 
 
 def _is_int(value) -> bool:
@@ -171,7 +186,12 @@ def _disagreement_rate_from_telemetry(telemetry: dict) -> float | None:
     disagreements = telemetry.get("disagree")
     if disagreements is None:
         disagreements = telemetry.get("disagreements")
-    if _is_int(dual) and dual > 0 and _is_int(disagreements) and disagreements >= 0:
+    # Only a *coherent* count pair recomputes a rate: ``disagree`` cannot exceed the
+    # ``dual_order_tasks`` it is a subset of. An incoherent block (``disagree > dual``, e.g.
+    # stale/hand-edited telemetry) would otherwise yield a rate above 1.0 and false-fail the
+    # instability gates; treat it as underivable and fall through to the stored rate / None.
+    if (_is_int(dual) and dual > 0 and _is_int(disagreements)
+            and 0 <= disagreements <= dual):
         return round(disagreements / dual, 3)
     rate = telemetry.get("disagreement_rate")
     return round(float(rate), 3) if _is_number(rate) else None

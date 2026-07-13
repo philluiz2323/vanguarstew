@@ -2,7 +2,10 @@
 
 import copy
 import os
+import subprocess
 import sys
+
+import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -17,6 +20,7 @@ from benchmark.generalization_gate import (  # noqa: E402
     failed_checks,
     generalization_headline,
 )
+from scripts import generalization_gate as cli  # noqa: E402
 
 
 def _gen(tuned, held, held_repos=3):
@@ -38,7 +42,7 @@ def _names(result):
 def test_a_run_that_generalizes_passes():
     result = check_generalization(_gen(0.68, 0.63), max_gap=0.1)   # gap 0.05
     assert result["passed"] is True
-    assert _names(result) == ["has_partitions", "enough_held_out_repos", "gap_within_tolerance"]
+    assert _names(result) == ["has_partitions", "no_partition_error", "enough_held_out_repos", "gap_within_tolerance"]
     assert result["gap"] == 0.05 and result["held_out_repos"] == 3
 
 
@@ -99,6 +103,24 @@ def test_composite_helper_guards_unscored_and_tolerates_malformed():
         assert _composite(bad) is None
     assert _composite({"scored_repos": "n", "composite_mean": 0.6}) == 0.6
     assert _composite({"scored_repos": 2, "composite_mean": "bad"}) is None    # non-numeric score
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_a_non_finite_composite_is_not_a_real_score(bad):
+    # json round-trips NaN/Infinity verbatim, so a non-finite composite_mean reaches the gate. It
+    # is not a real score: _composite must degrade it to None exactly as it does an unscored
+    # partition, guarded as headline_score/promotion/component_floor do. Otherwise an Infinity
+    # held-out composite makes gap -inf, false-passes gap_within_tolerance, and signs off
+    # "GENERALIZES" with inf/nan surfacing in the headline instead of degrading to n/a.
+    assert _composite(_part(4, bad)) is None
+    result = check_generalization({"tuned": _part(4, 0.70), "held_out": _part(3, bad),
+                                   "generalization_gap": None})
+    assert result["passed"] is False
+    assert "has_partitions" in failed_checks(result)
+    assert result["held_out_composite"] is None and result["gap"] is None
+    headline = generalization_headline(result)
+    assert "GENERALIZES" not in headline
+    assert "inf" not in headline.lower() and "nan" not in headline.lower()
 
 
 def test_a_held_out_score_above_tuned_is_within_tolerance():
@@ -253,3 +275,86 @@ def test_check_generalization_does_not_mutate_the_result():
     snapshot = copy.deepcopy(run)
     check_generalization(run)
     assert run == snapshot
+
+
+# --- no_partition_error: a partition that did not complete clean must fail the gate (#1329) ---
+# check_generalization uses BOTH partitions for its decision, so a top-level error or a per_repo
+# clone/freeze failure in EITHER tuned or held_out must fail no_partition_error -- mirroring
+# check_acceptance and check_promotion.run_completed -- or a partial, biased run signs off as
+# GENERALIZES.
+
+
+def _gen_pr(tuned_per_repo, held_per_repo):
+    result = _gen(0.68, 0.63)   # gap 0.05, would otherwise pass
+    result["tuned"]["per_repo"] = tuned_per_repo
+    result["held_out"]["per_repo"] = held_per_repo
+    return result
+
+
+def test_a_held_out_per_repo_error_fails_no_partition_error():
+    result = check_generalization(
+        _gen_pr(
+            [{"repo": "a", "tasks": 4}],
+            [{"repo": "b", "tasks": 4}, {"repo": "c", "tasks": 0, "error": "failed to clone"}],
+        )
+    )
+    assert result["passed"] is False
+    assert "no_partition_error" in failed_checks(result)
+
+
+def test_a_tuned_per_repo_error_fails_no_partition_error():
+    result = check_generalization(
+        _gen_pr(
+            [{"repo": "a", "tasks": 4}, {"repo": "b", "tasks": 0, "error": "not a git repo"}],
+            [{"repo": "c", "tasks": 4}],
+        )
+    )
+    assert result["passed"] is False
+    assert "no_partition_error" in failed_checks(result)
+
+
+def test_a_top_level_partition_error_fails_no_partition_error():
+    result = _gen(0.68, 0.63)
+    result["held_out"]["error"] = "RepoSetError: no repos to replay"
+    out = check_generalization(result)
+    assert out["passed"] is False
+    assert "no_partition_error" in failed_checks(out)
+
+
+def test_clean_per_repo_rows_still_pass_no_partition_error():
+    # Control: per_repo rows present but none carry an error -> the gate still passes.
+    result = check_generalization(
+        _gen_pr([{"repo": "a", "tasks": 4}], [{"repo": "b", "tasks": 4}, {"repo": "c", "tasks": 5}])
+    )
+    assert "no_partition_error" not in failed_checks(result)
+    assert result["passed"] is True
+
+
+def test_cli_directory_path_exits_two(tmp_path):
+    # Invoking the gate CLI on a directory artifact path is an OSError (IsADirectoryError on
+    # POSIX, PermissionError on Windows), not a FileNotFoundError -- it must exit 2 with an
+    # actionable message rather than dumping a raw traceback.
+    proc = subprocess.run(
+        [sys.executable, "-m", "scripts.generalization_gate", str(tmp_path)],
+        cwd=ROOT, capture_output=True, text=True,
+    )
+    assert proc.returncode == 2
+    assert "directory" in proc.stderr or "not readable" in proc.stderr
+    assert "Traceback" not in proc.stderr
+
+
+def test_load_artifact_is_a_directory_error_is_handled(monkeypatch, tmp_path, capsys):
+    # Platform-agnostic: a real directory never raises IsADirectoryError on Windows (it raises
+    # PermissionError), so force it to prove the dedicated handler is not dead code. On every
+    # platform load_artifact must raise SystemExit(2) with the specific directory message and no
+    # traceback.
+    def _raise_is_a_directory(*args, **kwargs):
+        raise IsADirectoryError(21, "Is a directory")
+
+    monkeypatch.setattr("builtins.open", _raise_is_a_directory)
+    with pytest.raises(SystemExit) as excinfo:
+        cli.load_artifact(str(tmp_path / "run.json"))
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "artifact path is a directory, not a file" in err
+    assert "Traceback" not in err

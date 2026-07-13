@@ -19,6 +19,7 @@ import json
 import logging
 
 from agent.context import context_for_agent
+from agent.planner import _release_cadence_signal
 
 logger = logging.getLogger(__name__)
 
@@ -209,12 +210,16 @@ def decide(context: dict, philosophy: dict, request: str, llm) -> dict:
     )
     user = (
         f"Repository philosophy:\n{json.dumps(philosophy, indent=1)[:3000]}\n\n"
-        f"Repository state:\n{_render(context)}\n\n"
+        f"Repository state:\n{_render(context)}\n"
+        f"{_release_context_note(context)}"
+        f"{_planning_version_bump_note(context, request)}"
         f"Decision request: {request}\n\n"
         f"Specialist perspectives already weighed (correctness, direction-fit, risk/timing):\n"
         f"{lens_block}\n\n"
         "Synthesize these into ONE final call. If the perspectives conflict, say which one "
         "wins and why — that tradeoff IS the rationale.\n\n"
+        "When the call is release-related, set version_bump to major/minor/patch when a "
+        "version cut is appropriate; otherwise null.\n\n"
         "Return JSON with keys:\n"
         f'  "action": one of {list(VALID_ACTIONS)},\n'
         '  "labels": list of labels if triaging (else []),\n'
@@ -241,6 +246,51 @@ def decide(context: dict, philosophy: dict, request: str, llm) -> dict:
     out["patch"] = _normalize_patch(out.get("patch"))
     out["version_bump"] = _normalize_version_bump(out.get("version_bump"))
     return out
+
+
+def _is_planning_request(request: str) -> bool:
+    return isinstance(request, str) and "plan the next" in request.lower()
+
+
+def _planning_version_bump_note(context: dict, request: str) -> str:
+    """Ask for version_bump on planning requests when release cadence or tags are visible."""
+    if not _is_planning_request(request):
+        return ""
+    ctx = context_for_agent(context) if isinstance(context, dict) else {}
+    has_tags = isinstance(ctx.get("releases"), list) and bool(ctx.get("releases"))
+    if not (_release_cadence_signal(context) or has_tags):
+        return ""
+    return (
+        "\nThe request is forward planning: even when action is plan, set version_bump to "
+        "major, minor, or patch when release cadence or frozen tags indicate the next cut.\n"
+    )
+
+
+def _release_context_note(context: dict) -> str:
+    """Surface frozen release tags so release/version_bump calls have a concrete base."""
+    if not isinstance(context, dict):
+        return ""
+    ctx = context_for_agent(context)
+    releases = ctx.get("releases")
+    if not isinstance(releases, list) or not releases:
+        return ""
+    tags = []
+    for rel in releases:
+        if not isinstance(rel, dict):
+            continue
+        for field in ("tag", "name"):
+            value = rel.get(field)
+            if isinstance(value, str) and value.strip():
+                tags.append(value.strip())
+                break
+    if not tags:
+        return ""
+    lines = "\n".join(f"- {tag}" for tag in tags[:3])
+    return (
+        f"\nRecent release tags at freeze (newest first):\n{lines}\n"
+        "When action is release or version_bump is set, infer major/minor/patch from "
+        "maintainer cadence and these tags.\n"
+    )
 
 
 def _render(context: dict) -> str:

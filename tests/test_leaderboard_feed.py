@@ -11,7 +11,13 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from scripts.leaderboard_feed import append_entry, to_leaderboard_entry  # noqa: E402
+from scripts.leaderboard_feed import (  # noqa: E402
+    _safe_per_repo,
+    _since_anchor_fields,
+    append_entry,
+    to_anchor_entry,
+    to_leaderboard_entry,
+)
 from scripts.score_pr_delta import combine_dual_target, score_pr_delta  # noqa: E402
 
 
@@ -100,6 +106,72 @@ def test_to_leaderboard_entry_skips_malformed_per_repo_rows():
     assert entry["public"]["per_repo"] == [{"repo": "https://github.com/a/b", "composite_delta": 0.03}]
 
 
+def _since_anchor_report():
+    """A real score_pr_delta()-shaped pair, as if diffing the candidate against a cached,
+    FIXED anchor baseline (e.g. v0.5.0) rather than the shifting base-branch one."""
+    anchor_baseline = _artifact(0.60, 0.55, 0.65)
+    public_since = score_pr_delta(anchor_baseline, _artifact(0.72, 0.68, 0.78))
+    public_since["diff"]["per_repo"] = [
+        {"repo": "https://github.com/pypa/hatch", "composite_mean": {"delta": 0.12}},
+    ]
+    private_since = score_pr_delta(anchor_baseline, _artifact(0.64, 0.60, 0.70))
+    private_since["diff"]["per_repo"] = [
+        {"repo": "https://github.com/some/hidden-repo", "composite_mean": {"delta": 0.04}},
+    ]
+    return {"anchor": "v0.5.0", "public": public_since, "private": private_since}
+
+
+def test_since_anchor_is_omitted_when_not_given():
+    combined = _real_combined_report()
+    entry = to_leaderboard_entry(combined, pr_number=3, timestamp="t")
+    assert "since_anchor" not in entry
+
+
+def test_since_anchor_carries_anchor_name_and_both_deltas():
+    combined = _real_combined_report()
+    since = _since_anchor_report()
+    entry = to_leaderboard_entry(combined, pr_number=3, timestamp="t", since_anchor=since)
+    assert entry["since_anchor"]["anchor"] == "v0.5.0"
+    assert entry["since_anchor"]["public"] == {
+        "composite_delta": 0.12, "composite_score": 0.72, "anchor_score": 0.6,
+    }
+    assert entry["since_anchor"]["private"] == {
+        "composite_delta": 0.04, "composite_score": 0.64, "anchor_score": 0.6,
+    }
+
+
+def test_since_anchor_never_leaks_private_per_repo_data():
+    combined = _real_combined_report()
+    since = _since_anchor_report()
+    entry = to_leaderboard_entry(combined, pr_number=3, timestamp="t", since_anchor=since)
+    assert set(entry["since_anchor"]["private"]) == {"composite_delta", "composite_score", "anchor_score"}
+    assert "hidden-repo" not in json.dumps(entry)
+
+
+def test_since_anchor_tolerates_malformed_input():
+    combined = _real_combined_report()
+    entry = to_leaderboard_entry(combined, pr_number=3, timestamp="t", since_anchor={"anchor": "v0.5.0"})
+    assert entry["since_anchor"] == {
+        "anchor": "v0.5.0",
+        "public": {"composite_delta": None, "composite_score": None, "anchor_score": None},
+        "private": {"composite_delta": None, "composite_score": None, "anchor_score": None},
+    }
+    # a non-dict since_anchor is treated the same as not passing one at all
+    entry2 = to_leaderboard_entry(combined, pr_number=3, timestamp="t", since_anchor="not a dict")
+    assert "since_anchor" not in entry2
+
+
+def test_since_anchor_score_is_consistent_with_delta():
+    """composite_score - anchor_score should equal composite_delta -- the bar chart on the
+    leaderboard page relies on these three numbers being internally consistent."""
+    combined = _real_combined_report()
+    since = _since_anchor_report()
+    entry = to_leaderboard_entry(combined, pr_number=3, timestamp="t", since_anchor=since)
+    for side in ("public", "private"):
+        fields = entry["since_anchor"][side]
+        assert round(fields["composite_score"] - fields["anchor_score"], 4) == fields["composite_delta"]
+
+
 def test_append_entry_creates_file_when_missing(tmp_path):
     path = str(tmp_path / "results.json")
     result = append_entry(path, {"a": 1})
@@ -130,3 +202,124 @@ def test_append_entry_raises_on_non_array_file(tmp_path):
         assert False, "expected ValueError"
     except ValueError:
         pass
+
+
+def test_to_anchor_entry_reads_composite_mean_directly_off_each_artifact():
+    """Anchor artifacts are raw run_eval outputs, not a score_pr_delta diff -- composite_mean
+    sits at the top level, not under diff.composite_mean."""
+    public_artifact = {"composite_mean": 0.717, "repos": 3, "scored_repos": 3}
+    private_artifact = {"composite_mean": 0.644, "repos": 3, "scored_repos": 3}
+    entry = to_anchor_entry("v0.5.0", public_artifact, private_artifact, timestamp="2026-07-10T09:00:00+00:00")
+    assert entry == {
+        "anchor": "v0.5.0",
+        "timestamp": "2026-07-10T09:00:00+00:00",
+        "public_score": 0.717,
+        "private_score": 0.644,
+    }
+
+
+def test_to_anchor_entry_defaults_timestamp_to_now():
+    entry = to_anchor_entry("v0.5.0", {"composite_mean": 0.6}, {"composite_mean": 0.6})
+    assert isinstance(entry["timestamp"], str) and entry["timestamp"]
+
+
+def test_to_anchor_entry_tolerates_missing_artifacts():
+    entry = to_anchor_entry("v0.5.0", None, None, timestamp="t")
+    assert entry == {"anchor": "v0.5.0", "timestamp": "t", "public_score": None, "private_score": None}
+
+
+def test_to_anchor_entry_never_includes_per_repo_or_repo_names():
+    public_artifact = {
+        "composite_mean": 0.717,
+        "per_repo": [{"repo": "https://github.com/pypa/hatch", "composite_mean": 0.8}],
+    }
+    private_artifact = {
+        "composite_mean": 0.644,
+        "per_repo": [{"repo": "https://github.com/some/hidden-repo", "composite_mean": 0.6}],
+    }
+    entry = to_anchor_entry("v0.5.0", public_artifact, private_artifact, timestamp="t")
+    assert set(entry) == {"anchor", "timestamp", "public_score", "private_score"}
+    assert "hidden-repo" not in json.dumps(entry)
+    assert "hatch" not in json.dumps(entry)
+
+
+# --- defensive contract: a non-dict where a nested composite dict is expected must be coerced
+#     to a skip/None, not raise AttributeError. A bare `value or {}` only guarded the falsy
+#     case, so a truthy scalar/list still crashed (#1381). Cover every site + both targets. ---
+
+_NON_DICTS = (0.5, "x", [1], True, 0)
+
+
+def test_safe_per_repo_tolerates_non_dict_composite_mean():
+    # A per_repo row whose composite_mean is a scalar/list (not the {baseline,candidate,delta}
+    # dict) must yield a None delta and still keep the row, never raise.
+    for bad in _NON_DICTS:
+        rows = _safe_per_repo({"diff": {"per_repo": [{"repo": "r", "composite_mean": bad}]}})
+        assert rows == [{"repo": "r", "composite_delta": None}], bad
+    # a non-dict report / diff is coerced too
+    for bad in _NON_DICTS:
+        assert _safe_per_repo(bad) == [], bad
+        assert _safe_per_repo({"diff": bad}) == [], bad
+
+
+def test_since_anchor_fields_tolerates_non_dict_composite_mean_both_targets():
+    # _scores reads diff.composite_mean.{delta,candidate,baseline} for BOTH the public and the
+    # private target; a non-dict composite_mean (or non-dict diff/report) must degrade to all
+    # None scores, never raise.
+    none_scores = {"composite_delta": None, "composite_score": None, "anchor_score": None}
+    for bad in _NON_DICTS:
+        out = _since_anchor_fields({
+            "anchor": "v0.5.0",
+            "public": {"diff": {"composite_mean": bad}},
+            "private": {"diff": {"composite_mean": bad}},
+        })
+        assert out["public"] == none_scores and out["private"] == none_scores, bad
+        # non-dict report and non-dict diff at the outer levels too
+        assert _since_anchor_fields({"anchor": "v", "public": bad, "private": bad}) == {
+            "anchor": "v", "public": none_scores, "private": none_scores}, bad
+        assert _since_anchor_fields({"public": {"diff": bad}, "private": {"diff": bad}})[
+            "public"] == none_scores, bad
+    # a non-dict since_anchor stays None
+    for bad in _NON_DICTS:
+        assert _since_anchor_fields(bad) is None, bad
+
+
+def test_to_leaderboard_entry_tolerates_non_dict_composite_deltas_and_targets():
+    # composite_deltas (public and private), and the public/private targets themselves, may be
+    # a non-dict on a malformed report -- the entry must build with None deltas, never raise.
+    for bad in _NON_DICTS:
+        entry = to_leaderboard_entry(
+            {"public": {"composite_deltas": bad}, "private": {"composite_deltas": bad}},
+            pr_number=1, timestamp="t",
+        )
+        assert entry["public"]["composite_delta"] is None, bad
+        assert entry["private"]["composite_delta"] is None, bad
+        assert entry["public"]["per_repo"] == [], bad
+        # public/private themselves non-dict, and a non-dict combined
+        entry2 = to_leaderboard_entry({"public": bad, "private": bad}, pr_number=1, timestamp="t")
+        assert entry2["public"] == {"composite_delta": None, "per_repo": []}, bad
+        assert entry2["private"] == {"composite_delta": None}, bad
+        assert to_leaderboard_entry(bad, pr_number=1, timestamp="t")["public"] == {
+            "composite_delta": None, "per_repo": []}, bad
+
+
+def test_to_leaderboard_entry_since_anchor_non_dict_composite_mean_does_not_raise():
+    # The since_anchor path is reached through to_leaderboard_entry too; a non-dict
+    # composite_mean there must not crash the whole entry build.
+    for bad in _NON_DICTS:
+        entry = to_leaderboard_entry(
+            {"public": {"composite_deltas": {"composite_mean": 0.05}}},
+            pr_number=1, timestamp="t",
+            since_anchor={"anchor": "v", "public": {"diff": {"composite_mean": bad}},
+                          "private": {"diff": {"composite_mean": bad}}},
+        )
+        assert entry["since_anchor"]["public"]["composite_delta"] is None, bad
+
+
+def test_to_anchor_entry_tolerates_non_dict_artifact():
+    # to_anchor_entry reads composite_mean off each raw artifact's top level; a non-dict
+    # artifact must give a None score, never raise.
+    for bad in _NON_DICTS:
+        entry = to_anchor_entry("v0.5.0", bad, bad, timestamp="t")
+        assert entry == {
+            "anchor": "v0.5.0", "timestamp": "t", "public_score": None, "private_score": None}, bad

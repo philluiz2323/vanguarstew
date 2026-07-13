@@ -105,7 +105,8 @@ def test_assess_repeatability_empty_min_runs_zero_does_not_raise():
 def test_assess_repeatability_all_unscored_min_runs_zero_does_not_raise():
     result = assess_repeatability([{"error": "x"}, "bad"], min_runs=0)
     assert result["runs"] == 0
-    assert result["reason"] == "no scored runs"
+    assert "repeat 1 not clean" in result["reason"]
+    assert "x" in result["reason"]
 
 
 def test_repeatability_headline_rejects_non_integer_runs():
@@ -209,6 +210,20 @@ def test_cli_missing_file_exits_two():
     assert proc.returncode == 2
 
 
+def test_cli_rejects_a_directory_path(tmp_path):
+    # A directory raises IsADirectoryError (POSIX) / PermissionError (Windows) from open() --
+    # both are OSError subclasses that must be caught, not just FileNotFoundError.
+    proc = subprocess.run(
+        [sys.executable, "-m", "scripts.repeatability_gate", str(tmp_path)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 2
+    assert "Traceback" not in proc.stderr
+    assert str(tmp_path) in proc.stderr
+
+
 def test_check_repeatability_does_not_mutate_inputs():
     artifacts = [_run(0.6), _run(0.61)]
     snap = copy.deepcopy(artifacts)
@@ -216,7 +231,23 @@ def test_check_repeatability_does_not_mutate_inputs():
     assert artifacts == snap
 
 
-def test_unscored_repeats_skipped_in_gate():
+def test_dirty_repeat_fails_gate_not_skipped():
     result = check_repeatability([_run(0.6), {"error": "no tasks"}, _run(0.62)])
-    assert result["runs"] == 2
-    assert result["passed"] is True
+    assert result["runs"] == 0
+    assert result["passed"] is False
+    assert "repeat 2 not clean" in result["reason"]
+    assert "scored_runs" in failed_checks(result)
+
+
+def test_partial_multi_repo_repeat_fails_gate():
+    dirty = {
+        "composite_mean": 0.66,
+        "scored_repos": 2,
+        "per_repo": [
+            {"repo": "a", "tasks": 4},
+            {"repo": "b", "tasks": 0, "error": "clone failed"},
+        ],
+    }
+    result = check_repeatability([dirty, _run(0.64)])
+    assert result["passed"] is False
+    assert "repeat 1 not clean" in result["reason"]
