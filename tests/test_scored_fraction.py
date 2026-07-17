@@ -1,5 +1,6 @@
 """Tests for the scored-fraction utility (deterministic, offline)."""
 
+import errno
 import json
 import os
 import subprocess
@@ -216,6 +217,51 @@ def test_load_artifact_permission_error_is_clean(monkeypatch, tmp_path, capsys):
     assert "artifact is not readable" in err
     assert "[Errno" not in err
     assert "Traceback" not in err
+
+
+def test_cli_broken_symlink_reports_the_dangling_target(tmp_path, capsys):
+    # A dangling symlink raises FileNotFoundError just like a missing path, so it used to report
+    # "not found" -- misdiagnosing it, since the link exists and only its target is gone. islink()
+    # separates the two.
+    link = tmp_path / "broken.json"
+    link.symlink_to(tmp_path / "nonexistent.json")
+    assert cli.run([str(link)]) == 2
+    assert capsys.readouterr().err == (
+        f"artifact is a broken symlink (target does not exist): {link}\n"
+    )
+
+
+def test_load_artifact_symlink_loop_names_the_loop(monkeypatch, tmp_path, capsys):
+    # A symlink loop raises OSError(ELOOP); it reached the generic OSError arm and leaked the bare
+    # errno ("[Errno 40] ...") instead of naming the loop.
+    path = str(tmp_path / "loop.json")
+
+    def _raise(*args, **kwargs):
+        raise OSError(errno.ELOOP, "Too many levels of symbolic links", path)
+
+    monkeypatch.setattr("builtins.open", _raise)
+    with pytest.raises(SystemExit) as excinfo:
+        cli.load_artifact(path)
+    assert excinfo.value.code == 2
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert "[Errno" not in err
+    assert err == f"artifact path is a symlink loop: {path}\n"
+
+
+def test_load_artifact_other_oserror_keeps_the_generic_message(monkeypatch, tmp_path, capsys):
+    # A non-ELOOP OSError (a real I/O error) still reports its underlying text -- only the loop
+    # case is special-cased.
+    path = str(tmp_path / "run.json")
+
+    def _raise(*args, **kwargs):
+        raise OSError(errno.EIO, "Input/output error", path)
+
+    monkeypatch.setattr("builtins.open", _raise)
+    with pytest.raises(SystemExit) as excinfo:
+        cli.load_artifact(path)
+    assert excinfo.value.code == 2
+    assert capsys.readouterr().err.startswith(f"cannot read artifact ({path}):")
 
 
 def test_module_main_no_arg_exits_nonzero():

@@ -9,7 +9,9 @@ invalid, or the root value is not an object.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
+import os
 import sys
 
 from benchmark.scored_fraction import scored_fraction_headline, summarize_scored_fraction
@@ -20,7 +22,14 @@ def load_artifact(path: str) -> dict:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
-        print(f"artifact not found: {path}", file=sys.stderr)
+        # A dangling symlink raises FileNotFoundError too; islink() separates it from a plain
+        # missing path so the message names the real problem (the link exists, its target does
+        # not) instead of misreporting it as "not found". Checked after open() fails, so there
+        # is no exists()/open() TOCTOU pre-check that could itself raise on a symlink loop.
+        if os.path.islink(path):
+            print(f"artifact is a broken symlink (target does not exist): {path}", file=sys.stderr)
+        else:
+            print(f"artifact not found: {path}", file=sys.stderr)
         raise SystemExit(2) from None
     except PermissionError:
         print(f"artifact is not readable (check file permissions): {path}", file=sys.stderr)
@@ -29,7 +38,12 @@ def load_artifact(path: str) -> dict:
         print(f"artifact path is a directory, not a file: {path}", file=sys.stderr)
         raise SystemExit(2) from None
     except OSError as exc:
-        print(f"cannot read artifact ({path}): {exc}", file=sys.stderr)
+        # A symlink loop raises OSError(ELOOP); name it instead of leaking the bare errno, and
+        # keep any other real read failure's underlying text.
+        if getattr(exc, "errno", None) == errno.ELOOP:
+            print(f"artifact path is a symlink loop: {path}", file=sys.stderr)
+        else:
+            print(f"cannot read artifact ({path}): {exc}", file=sys.stderr)
         raise SystemExit(2) from None
     except UnicodeDecodeError as exc:
         # Non-UTF-8 mid-read: keep a distinct message (UnicodeDecodeError subclasses
